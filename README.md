@@ -85,6 +85,7 @@ Edit `.env`:
 | `AUTH_METHOD` | `qr` | `qr` or `pairing` (8-character code) |
 | `AUTH_DIR` | `./auth` | Where the session is stored |
 | `LOG_DIR` | `./logs` | Where `bot.log` is written |
+| `DATA_DIR` | `./data` | Latest-message IDs and timestamps per group, needed for deleting chats (no message content) |
 | `CONFIRM_TTL_SECONDS` | `120` | How long a preview can be confirmed |
 | `REMOVE_BATCH_SIZE` | `5` | Members removed per WhatsApp request |
 | `REMOVE_BATCH_DELAY_MS` | `3000` | Pause between batches |
@@ -181,10 +182,14 @@ Link the device once interactively (`npm start`) before handing it to pm2, becau
 | `!removeall <group>` | Preview removing **all non-admin** members |
 | `!removeall 1,3,7` / `!removeall 1-4` | The same for **several groups** at once, by group number |
 | `!removeall Group A \| Group B` | Several groups by name, separated by `\|` |
-| `!cancel` | Discards the pending operation, or stops a running removal after its current batch |
+| `!emptygroups` | Admin groups with **no regular members left** (only you, or you plus other admins) |
+| `!nonadmingroups` | Groups where you're **not** an admin |
+| `!leave <numbers>` / `!leave all` | Leave groups and delete their chats for you. In admin groups, the other admins are demoted and removed first. `all` means every group in your last `!emptygroups` or `!nonadmingroups` list |
+| `!cancel` | Discards the pending operation, or stops a running one at its next safe point |
 | `!status` | Connection, uptime, account, group count, last command, pending/running operation |
 | `CONFIRM` | Runs a pending `!remove` |
 | `CONFIRM REMOVEALL` | Runs a pending `!removeall` |
+| `CONFIRM LEAVE` | Runs a pending `!leave` |
 
 Add `--dry-run` to `!remove` or `!removeall` to simulate that single operation.
 
@@ -279,6 +284,54 @@ Bot:  Removal completed — 3 groups
 - `!cancel` stops after the current batch, and any groups not yet started are left untouched. If the connection is lost, the remaining groups aren't attempted either.
 - Long previews are split into several messages.
 
+### Leaving leftover groups and deleting their chats
+
+```text
+You:  !emptygroups
+Bot:  Groups With No Regular Members
+
+      2. Old Project — only you
+      5. Hackathon 2024 — you + 2 admins
+      9. Trip Planning — you + 1 admin (creator can't be removed)
+      11. Club Archive — you + 1 admin [chat can't be deleted]
+
+You:  !leave all
+Bot:  Leave Preview
+
+      Groups: 3
+
+      2. Old Project [ADMIN] — leave, delete chat
+      5. Hackathon 2024 [ADMIN] — demote & remove 2 admins, leave, delete chat
+         - Ann (+91…)
+         - Bob (+91…)
+      9. Trip Planning [ADMIN] — leave, delete chat
+         Raj (+91…) is the group creator and can't be removed (will remain)
+
+      Skipped (chat can't be deleted — no known messages):
+      - Club Archive
+
+      Reply:
+      CONFIRM LEAVE
+
+You:  CONFIRM LEAVE
+Bot:  Leaving 3 group(s) and deleting their chats…
+      …
+Bot:  Leave completed — 3 groups
+      Left: 3 · Chats deleted: 3 · Failed: 0
+```
+
+For each group, in order:
+1. **Re-check.** The group is skipped if you're no longer a member, regular members have joined, or its chat can't be deleted.
+2. **Admin groups only:** the other admins are **demoted, then removed**. WhatsApp doesn't let anyone remove the group creator, so a creator who isn't you stays and is reported.
+3. **Leave**, then check you're really gone. If you're still listed as a member, the chat is not deleted.
+4. **Delete the chat for you.** The deletion is synced to your devices.
+
+`!nonadmingroups` then `!leave all` does the same for groups where you aren't an admin (just leave and delete the chat). You can also mix groups from both lists by number, e.g. `!leave 2,14`.
+
+**Why some chats "can't be deleted":** WhatsApp's delete-chat action needs the ID of the chat's latest message, and Baileys doesn't store messages. The bot therefore records the latest message ID and timestamp for each group it sees, in `data/last-messages.json` (git-ignored, never any message content). A group where the bot has never seen a message is **skipped and not left**. To fix it, wait until any message arrives in that group while the bot is running (right after first linking, WhatsApp also syncs recent history), then run the command again. Or leave and delete that group by hand.
+
+**Limits:** WhatsApp has no "delete group for everyone". Removing everyone and leaving is the closest you can get.
+
 ### Safety rules built in
 
 - Commands are accepted **only** when you send them from your own account, in your own self-chat. Anything anyone else sends is silently ignored, and so are commands you type in groups or other chats.
@@ -315,6 +368,9 @@ Bot:  Removal completed — 3 groups
 | `temporary WhatsApp error` / `429` in the report | You hit rate limits. Wait a few minutes, then run the command again for the members who failed. You can also increase `REMOVE_BATCH_DELAY_MS`. |
 | `permission error` for a member | WhatsApp refused (for example, you lost admin rights mid-operation). |
 | `Reconnect failed` loops | Check your network connection. The bot retries with backoff, waiting up to 60s between attempts. |
+| `[chat can't be deleted]` / group skipped by `!leave` | The bot hasn't seen a message in that group yet. Wait for one to arrive while the bot runs, then retry. Or delete the chat manually. |
+| `chat delete FAILED … delete it manually` | You left the group, but WhatsApp rejected the chat deletion. Delete the chat on your phone (long-press it → Delete chat). |
+| `leave not confirmed` | WhatsApp accepted the leave request, but still lists you as a member. Check the group on your phone. The chat was not deleted. |
 | `npm install` fails on engines | Upgrade to Node 20+ (`nvm install 20`). |
 
 ## 12. How to stop the bot
@@ -367,7 +423,8 @@ Tests (`npm test`) cover command parsing, owner authorization, admin detection, 
 
 ## 14. Known limitations
 
-- **Admins cannot be removed by this bot.** This is a deliberate design choice. The group creator can't be removed by anyone through WhatsApp.
+- **`!remove` and `!removeall` never remove admins.** Admins are only demoted and removed by `!leave`, in groups with no regular members left, after an explicit `CONFIRM LEAVE`. The group creator can't be removed by anyone through WhatsApp.
+- **Deleting a chat needs a known message** from that group (see above). The bot can't read back whether your phone applied the deletion. It reports "chat deleted" once WhatsApp has accepted the change.
 - **Community parent groups** are hidden from `!groups`. Manage members in the community's sub-groups.
 - **Commands work only from your own account's self-chat.** Controlling the bot from a second phone number isn't supported.
 - **Removals can't be undone by the bot.** Re-adding people requires them to rejoin, or you adding them manually.

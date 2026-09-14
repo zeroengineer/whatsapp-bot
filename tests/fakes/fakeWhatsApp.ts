@@ -6,7 +6,9 @@ import { GroupService } from '../../src/services/groupService.js';
 import { MemberService } from '../../src/services/memberService.js';
 import { RemovalService, type RemovalOptions } from '../../src/services/removalService.js';
 import { createNullLogger } from '../../src/utils/logger.js';
+import { LeaveService } from '../../src/services/leaveService.js';
 import {
+  ChatDeleteUnavailableError,
   GroupNotFoundError,
   NotConnectedError,
   type ConnectionStatus,
@@ -49,8 +51,9 @@ export class FakeWhatsAppClient implements WhatsAppClient {
   reconnects = true;
   private msgCounter = 0;
 
-  addGroup(group: GroupInfo): GroupInfo {
+  addGroup(group: GroupInfo, opts: { deletable?: boolean } = {}): GroupInfo {
     this.groups.set(group.jid, structuredClone(group));
+    if (opts.deletable !== false) this.deletableChats.add(group.jid);
     return group;
   }
 
@@ -70,17 +73,18 @@ export class FakeWhatsAppClient implements WhatsAppClient {
   }
   async listGroups(): Promise<GroupInfo[]> {
     if (this.status !== 'open') throw new NotConnectedError();
-    return [...this.groups.values()].map((g) => structuredClone(g));
+    return [...this.groups.values()].filter((g) => !this.leftGroups.has(g.jid)).map((g) => structuredClone(g));
   }
   async getGroup(jid: string): Promise<GroupInfo> {
     if (this.status !== 'open') throw new NotConnectedError();
     const g = this.groups.get(jid);
-    if (!g) throw new GroupNotFoundError(jid);
+    if (!g || this.leftGroups.has(jid)) throw new GroupNotFoundError(jid);
     return structuredClone(g);
   }
   async removeParticipants(groupJid: string, jids: string[]): Promise<ParticipantUpdateResult[]> {
     if (this.status !== 'open') throw new NotConnectedError();
     this.removeCalls.push({ groupJid, jids: [...jids] });
+    this.callLog.push(`remove:${groupJid}`);
     const results = this.onRemove
       ? await this.onRemove(groupJid, jids, this.removeCalls.length)
       : jids.map((jid) => ({ jid, status: '200' }));
@@ -92,6 +96,51 @@ export class FakeWhatsAppClient implements WhatsAppClient {
     }
     return results;
   }
+  /** Chats that can be deleted (addGroup marks every group deletable by default). */
+  deletableChats = new Set<string>();
+  leftGroups = new Set<string>();
+  demoteCalls: { groupJid: string; jids: string[] }[] = [];
+  leaveCalls: string[] = [];
+  deleteChatCalls: string[] = [];
+  /** Ordered log of destructive calls, e.g. "demote:g@g.us", "remove:g@g.us", "leave:g@g.us", "delete:g@g.us". */
+  callLog: string[] = [];
+  onDemote: RemoveHandler | undefined;
+  onLeave: ((groupJid: string) => Promise<void> | void) | undefined;
+  onDeleteChat: ((groupJid: string) => Promise<void> | void) | undefined;
+
+  async demoteParticipants(groupJid: string, jids: string[]): Promise<ParticipantUpdateResult[]> {
+    if (this.status !== 'open') throw new NotConnectedError();
+    this.demoteCalls.push({ groupJid, jids: [...jids] });
+    this.callLog.push(`demote:${groupJid}`);
+    const results = this.onDemote ? await this.onDemote(groupJid, jids, this.demoteCalls.length) : jids.map((jid) => ({ jid, status: '200' }));
+    const g = this.groups.get(groupJid);
+    if (g) {
+      const ok = new Set(results.filter((r) => r.status === '200').map((r) => r.jid));
+      g.participants = g.participants.map((p) => (ok.has(p.jid) ? { ...p, role: 'member' as const } : p));
+    }
+    return results;
+  }
+
+  async leaveGroup(groupJid: string): Promise<void> {
+    if (this.status !== 'open') throw new NotConnectedError();
+    this.leaveCalls.push(groupJid);
+    this.callLog.push(`leave:${groupJid}`);
+    if (this.onLeave) return this.onLeave(groupJid);
+    this.leftGroups.add(groupJid);
+  }
+
+  canDeleteChat(groupJid: string): boolean {
+    return this.deletableChats.has(groupJid);
+  }
+
+  async deleteChatForMe(groupJid: string): Promise<void> {
+    if (this.status !== 'open') throw new NotConnectedError();
+    if (!this.deletableChats.has(groupJid)) throw new ChatDeleteUnavailableError(groupJid);
+    this.callLog.push(`delete:${groupJid}`);
+    if (this.onDeleteChat) await this.onDeleteChat(groupJid);
+    this.deleteChatCalls.push(groupJid);
+  }
+
   async sendText(chatJid: string, text: string): Promise<string> {
     this.sent.push({ chatJid, text });
     return `BOT-${++this.msgCounter}`;
@@ -110,6 +159,7 @@ export function testConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     authMethod: 'qr',
     authDir: '/tmp/auth',
     logDir: '/tmp/logs',
+    dataDir: '/tmp/data',
     confirmTtlMs: 120_000,
     removeBatchSize: 5,
     removeBatchDelayMs: 0,
@@ -144,19 +194,22 @@ export function createHarness(opts: { config?: Partial<AppConfig>; removal?: Par
   const logger = createNullLogger();
   const state: BotState = { startedAt: now(), memberSnapshots: new Map() };
   const sleeps: number[] = [];
+  const sleep = async (ms: number) => {
+    sleeps.push(ms);
+  };
+  const removal = new RemovalService(wa, logger, {
+    batchSize: config.removeBatchSize,
+    batchDelayMs: config.removeBatchDelayMs,
+    sleep,
+    reconnectWaitMs: 10,
+    ...opts.removal,
+  });
   const services: Services = {
     groups: new GroupService(wa, state),
     members: new MemberService(state),
     confirmations: new ConfirmationService(config.confirmTtlMs, now),
-    removal: new RemovalService(wa, logger, {
-      batchSize: config.removeBatchSize,
-      batchDelayMs: config.removeBatchDelayMs,
-      sleep: async (ms) => {
-        sleeps.push(ms);
-      },
-      reconnectWaitMs: 10,
-      ...opts.removal,
-    }),
+    removal,
+    leave: new LeaveService(wa, removal, logger, { batchDelayMs: config.removeBatchDelayMs, sleep, now, leaveNoticeWaitMs: 0 }),
   };
   const router = new CommandRouter({ wa, config, logger, state, services, now });
 

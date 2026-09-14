@@ -1,8 +1,14 @@
 import { randomUUID } from 'node:crypto';
 import type { ConfirmToken } from '../core/parser.js';
-import { describeOperation, UserError, type OperationType, type PendingOperation } from '../core/types.js';
+import { describeOperation, UserError, type NewOperation, type OperationType, type PendingOperation } from '../core/types.js';
 
-export const tokenFor = (type: OperationType): ConfirmToken => (type === 'removeall' ? 'CONFIRM REMOVEALL' : 'CONFIRM');
+const TOKENS: Record<OperationType, ConfirmToken> = {
+  remove: 'CONFIRM',
+  removeall: 'CONFIRM REMOVEALL',
+  leave: 'CONFIRM LEAVE',
+};
+
+export const tokenFor = (type: OperationType): ConfirmToken => TOKENS[type];
 
 export type ConsumeResult =
   | { ok: true; op: PendingOperation }
@@ -30,7 +36,7 @@ export class ConfirmationService {
     return this.pending;
   }
 
-  create(input: Omit<PendingOperation, 'id' | 'createdAt' | 'expiresAt'>): PendingOperation {
+  create<T extends NewOperation>(input: T): T & PendingOperation {
     const existing = this.getPending();
     if (existing) {
       throw new UserError(
@@ -39,8 +45,9 @@ export class ConfirmationService {
       );
     }
     const createdAt = this.now();
-    this.pending = { ...input, id: randomUUID().slice(0, 8), createdAt, expiresAt: createdAt + this.ttlMs };
-    return this.pending;
+    const op = { ...input, id: randomUUID().slice(0, 8), createdAt, expiresAt: createdAt + this.ttlMs } as T & PendingOperation;
+    this.pending = op;
+    return op;
   }
 
   cancel(): PendingOperation | undefined {

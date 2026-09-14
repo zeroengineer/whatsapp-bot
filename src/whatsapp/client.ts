@@ -65,8 +65,27 @@ export interface WhatsAppClient {
   getGroup(jid: string): Promise<GroupInfo>;
   /** Removes participants. Throws on request-level failure; returns per-participant statuses otherwise. */
   removeParticipants(groupJid: string, participantJids: string[]): Promise<ParticipantUpdateResult[]>;
+  /** Demotes admins to regular members. Per-participant statuses, like removeParticipants. */
+  demoteParticipants(groupJid: string, participantJids: string[]): Promise<ParticipantUpdateResult[]>;
+  /** Leaves the group. Resolves when WhatsApp accepted the request. */
+  leaveGroup(groupJid: string): Promise<void>;
+  /** True if the chat can be deleted for me (the latest message key of the chat is known). */
+  canDeleteChat(groupJid: string): boolean;
+  /**
+   * Deletes the group chat for this account only (synced to your devices).
+   * Waits up to `waitMs` for a message newer than `newerThanMs` (e.g. the "you left" notice) first.
+   * Throws ChatDeleteUnavailableError if no message key is known.
+   */
+  deleteChatForMe(groupJid: string, opts?: { newerThanMs?: number; waitMs?: number }): Promise<void>;
   /** Sends a text message and returns the sent message id. */
   sendText(chatJid: string, text: string): Promise<string | undefined>;
+}
+
+export class ChatDeleteUnavailableError extends Error {
+  constructor(jid: string) {
+    super(`No known message for chat ${jid}; it cannot be deleted`);
+    this.name = 'ChatDeleteUnavailableError';
+  }
 }
 
 export class GroupNotFoundError extends Error {

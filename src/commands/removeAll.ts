@@ -1,9 +1,9 @@
 import { IndexSpecError, parseGroupSelection, type GroupSelection } from '../core/parser.js';
-import { describeOperation, totalTargets, UserError, type Command, type GroupRemovalPlan, type PendingOperation } from '../core/types.js';
+import { describeOperation, totalTargets, UserError, type Command, type GroupRemovalPlan, type RemovalOperation } from '../core/types.js';
 
-const expiry = (op: PendingOperation) => Math.round((op.expiresAt - op.createdAt) / 1000);
+const expiry = (op: RemovalOperation) => Math.round((op.expiresAt - op.createdAt) / 1000);
 
-export function formatRemoveAllPreview(op: PendingOperation, prefix: string): string {
+export function formatRemoveAllPreview(op: RemovalOperation, prefix: string): string {
   const plan = op.groups[0]!;
   return [
     op.dryRun ? 'WARNING (DRY RUN)' : 'WARNING',
@@ -25,7 +25,7 @@ export function formatRemoveAllPreview(op: PendingOperation, prefix: string): st
 }
 
 export function formatMultiRemoveAllPreview(
-  op: PendingOperation,
+  op: RemovalOperation,
   emptyGroups: GroupRemovalPlan[],
   usedFreshList: boolean,
   prefix: string,

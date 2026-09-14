@@ -6,6 +6,7 @@ import type { Logger } from '../utils/logger.js';
 import { normalizeJid, splitJid } from '../utils/permissions.js';
 import { errorStatusCode, withTimeout } from '../utils/retry.js';
 import {
+  ChatDeleteUnavailableError,
   GroupNotFoundError,
   NotConnectedError,
   type ConnectionStatus,
@@ -16,6 +17,7 @@ import {
   type WhatsAppClient,
 } from './client.js';
 import type { WhatsAppConnection } from './connection.js';
+import type { LastMessageIndex } from './messageIndex.js';
 
 const digitsOf = (jidOrPhone: string | undefined): string | undefined => {
   if (!jidOrPhone) return undefined;
@@ -28,6 +30,7 @@ export class BaileysWhatsAppClient implements WhatsAppClient {
     private readonly connection: WhatsAppConnection,
     private readonly logger: Logger,
     private readonly timeoutMs: number,
+    private readonly messageIndex: LastMessageIndex,
   ) {}
 
   private socket() {
@@ -80,6 +83,39 @@ export class BaileysWhatsAppClient implements WhatsAppClient {
       'remove participants',
     );
     return results.map((r) => ({ jid: r.jid ?? '', status: String(r.status) }));
+  }
+
+  async demoteParticipants(groupJid: string, participantJids: string[]): Promise<ParticipantUpdateResult[]> {
+    const sock = this.socket();
+    const results = await withTimeout(
+      sock.groupParticipantsUpdate(groupJid, participantJids, 'demote'),
+      this.timeoutMs,
+      'demote participants',
+    );
+    return results.map((r) => ({ jid: r.jid ?? '', status: String(r.status) }));
+  }
+
+  async leaveGroup(groupJid: string): Promise<void> {
+    const sock = this.socket();
+    await withTimeout(sock.groupLeave(groupJid), this.timeoutMs, 'leave group');
+  }
+
+  canDeleteChat(groupJid: string): boolean {
+    return this.messageIndex.has(groupJid);
+  }
+
+  async deleteChatForMe(groupJid: string, opts: { newerThanMs?: number; waitMs?: number } = {}): Promise<void> {
+    let entry = this.messageIndex.get(groupJid);
+    if (!entry) throw new ChatDeleteUnavailableError(groupJid);
+    if (opts.newerThanMs !== undefined && opts.waitMs) {
+      entry = (await this.messageIndex.waitForNewer(groupJid, Math.floor(opts.newerThanMs / 1000), opts.waitMs)) ?? this.messageIndex.get(groupJid) ?? entry;
+    }
+    const sock = this.socket();
+    await withTimeout(
+      sock.chatModify({ delete: true, lastMessages: [{ key: entry.key, messageTimestamp: entry.messageTimestamp }] }, groupJid),
+      this.timeoutMs,
+      'delete chat',
+    );
   }
 
   async sendText(chatJid: string, text: string): Promise<string | undefined> {

@@ -1,9 +1,12 @@
-import { splitGroupAndIndexes, type GroupAndIndexSplit } from '../core/parser.js';
+import { parseIndexSpec, splitGroupAndIndexes, type GroupAndIndexSplit } from '../core/parser.js';
 import { UserError, type BotState } from '../core/types.js';
-import { selfIsGroupAdmin } from '../utils/permissions.js';
-import type { GroupInfo, SelfInfo, WhatsAppClient } from '../whatsapp/client.js';
+import { isAdmin, isSelfParticipant, selfIsGroupAdmin } from '../utils/permissions.js';
+import { GroupNotFoundError, type GroupInfo, type SelfInfo, type WhatsAppClient } from '../whatsapp/client.js';
 
 export const MAX_GROUPS_PER_OPERATION = 20;
+export const LEAVE_LIST_TTL_MS = 10 * 60_000;
+
+export type GroupCategory = 'leftover' | 'nonadmin' | 'active';
 
 const normalizeName = (s: string) => s.normalize('NFKC').toLowerCase().replace(/\s+/g, ' ').trim();
 
@@ -91,6 +94,90 @@ export class GroupService {
     const self = this.requireSelf();
     const all = await this.listGroups();
     return all.map((group, i) => ({ index: i + 1, group })).filter(({ group }) => selfIsGroupAdmin(group, self));
+  }
+
+  /**
+   * leftover: you are admin and every other member is an admin (or you are alone);
+   * nonadmin: you are a member but not an admin;
+   * active: you are admin and regular members remain.
+   */
+  static classify(group: GroupInfo, self: SelfInfo): GroupCategory {
+    if (!selfIsGroupAdmin(group, self)) return 'nonadmin';
+    const regular = group.participants.some((p) => !isSelfParticipant(p, self) && !isAdmin(p));
+    return regular ? 'active' : 'leftover';
+  }
+
+  /** Groups of one category, keeping !groups numbering. Remembers the list for `!leave all`. */
+  async listByCategory(category: 'leftover' | 'nonadmin', now: number): Promise<{ index: number; group: GroupInfo }[]> {
+    const self = this.requireSelf();
+    const all = await this.listGroups();
+    const found = all.map((group, i) => ({ index: i + 1, group })).filter(({ group }) => GroupService.classify(group, self) === category);
+    this.state.lastLeaveList = { category, jids: found.map((f) => f.group.jid), at: now };
+    return found;
+  }
+
+  /**
+   * Resolve `!leave` arguments ("all" or group numbers) to fresh group metadata.
+   * Rejects the whole selection if a number is invalid, an admin group still has regular members,
+   * or too many groups are selected.
+   */
+  async resolveLeaveSelection(args: string, now: number): Promise<{ groups: { index: number; group: GroupInfo }[] }> {
+    const self = this.requireSelf();
+    const arg = args.trim().toLowerCase();
+    let jids: string[];
+
+    if (arg === 'all') {
+      const last = this.state.lastLeaveList;
+      if (!last || now - last.at > LEAVE_LIST_TTL_MS) {
+        throw new UserError('Send !emptygroups or !nonadmingroups first, then !leave all within 10 minutes.');
+      }
+      if (last.jids.length === 0) throw new UserError('Your last list was empty. Nothing to leave.');
+      jids = last.jids;
+    } else {
+      let indexes: number[];
+      try {
+        indexes = parseIndexSpec(arg);
+      } catch {
+        throw new UserError('Usage: !leave <group numbers>  (e.g. !leave 2,5)  or  !leave all');
+      }
+      const list = await this.currentList();
+      const missing = indexes.filter((n) => !list[n - 1]);
+      if (missing.length > 0) throw new UserError(`Group number(s) ${missing.join(', ')} do not exist (you have ${list.length} groups).`);
+      jids = indexes.map((n) => list[n - 1]!.jid);
+    }
+
+    const unique = [...new Set(jids)];
+    if (unique.length > MAX_GROUPS_PER_OPERATION) {
+      throw new UserError(`Too many groups selected (${unique.length}). The limit is ${MAX_GROUPS_PER_OPERATION} per operation.`);
+    }
+
+    const list = await this.currentList();
+    const groups: { index: number; group: GroupInfo }[] = [];
+    const active: string[] = [];
+    const gone: string[] = [];
+    for (const jid of unique) {
+      const index = list.findIndex((g) => g.jid === jid) + 1;
+      let group: GroupInfo;
+      try {
+        group = await this.wa.getGroup(jid);
+      } catch (err) {
+        if (err instanceof GroupNotFoundError) {
+          gone.push(list[index - 1]?.name ?? jid);
+          continue;
+        }
+        throw err;
+      }
+      if (GroupService.classify(group, self) === 'active') active.push(group.name);
+      else groups.push({ index, group });
+    }
+
+    const problems: string[] = [];
+    if (active.length > 0) {
+      problems.push(`These groups still have regular members — use !removeall first:\n${active.map((n) => `- ${n}`).join('\n')}`);
+    }
+    if (gone.length > 0) problems.push(`No longer accessible (already left?):\n${gone.map((n) => `- ${n}`).join('\n')}`);
+    if (problems.length > 0) throw new UserError(`${problems.join('\n\n')}\n\nNothing was queued.`);
+    return { groups };
   }
 
   /**

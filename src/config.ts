@@ -17,6 +17,7 @@ const ConfigSchema = z.object({
   AUTH_METHOD: z.enum(['qr', 'pairing']).default('qr'),
   AUTH_DIR: z.string().default('./auth'),
   LOG_DIR: z.string().default('./logs'),
+  DATA_DIR: z.string().default('./data'),
   CONFIRM_TTL_SECONDS: z.coerce.number().int().min(15).max(3600).default(120),
   REMOVE_BATCH_SIZE: z.coerce.number().int().min(1).max(50).default(5),
   REMOVE_BATCH_DELAY_MS: z.coerce.number().int().min(0).max(600_000).default(3000),
@@ -31,6 +32,7 @@ export interface AppConfig {
   authMethod: 'qr' | 'pairing';
   authDir: string;
   logDir: string;
+  dataDir: string;
   confirmTtlMs: number;
   removeBatchSize: number;
   removeBatchDelayMs: number;
@@ -60,6 +62,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, argv: string[] 
     authMethod: c.AUTH_METHOD,
     authDir: path.resolve(c.AUTH_DIR),
     logDir: path.resolve(c.LOG_DIR),
+    dataDir: path.resolve(c.DATA_DIR),
     confirmTtlMs: c.CONFIRM_TTL_SECONDS * 1000,
     removeBatchSize: c.REMOVE_BATCH_SIZE,
     removeBatchDelayMs: c.REMOVE_BATCH_DELAY_MS,

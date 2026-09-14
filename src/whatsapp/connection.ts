@@ -22,6 +22,7 @@ import type { Logger } from '../utils/logger.js';
 import { normalizeJid, splitJid } from '../utils/permissions.js';
 import { backoffDelay, errorStatusCode, withTimeout } from '../utils/retry.js';
 import type { ConnectionStatus, IncomingMessage, SelfInfo } from './client.js';
+import type { LastMessageIndex } from './messageIndex.js';
 import { toIncomingMessage } from './messages.js';
 
 /** Disconnect reasons after which reconnecting would be wrong or futile. */
@@ -52,6 +53,7 @@ export class WhatsAppConnection extends EventEmitter<ConnectionEvents> {
   constructor(
     private readonly config: AppConfig,
     private readonly logger: Logger,
+    private readonly messageIndex?: LastMessageIndex,
   ) {
     super();
   }
@@ -195,6 +197,8 @@ export class WhatsAppConnection extends EventEmitter<ConnectionEvents> {
 
     sock.ev.on('messages.upsert', ({ messages, type }) => {
       if (!isCurrent()) return;
+      // Track the newest message key per group (all upsert types, including system notices) for chat deletion.
+      for (const raw of messages) this.messageIndex?.record(raw);
       // 'notify' = new live messages. 'append' covers our own sends and messages received while offline,
       // which must never be executed as commands.
       if (type !== 'notify') return;
@@ -204,7 +208,12 @@ export class WhatsAppConnection extends EventEmitter<ConnectionEvents> {
       }
     });
 
-    const rememberContacts = (contacts: Partial<Contact>[]) => {
+    sock.ev.on('messaging-history.set', ({ messages }) => {
+      if (!isCurrent()) return;
+      for (const raw of messages) this.messageIndex?.record(raw);
+    });
+
+    const rememberContacts =(contacts: Partial<Contact>[]) => {
       for (const c of contacts) {
         const name = c.name ?? c.notify ?? c.verifiedName;
         if (!name) continue;

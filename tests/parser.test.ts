@@ -29,6 +29,8 @@ describe('parseInput', () => {
   it('recognises exact confirmation tokens only', () => {
     expect(parseInput('CONFIRM', '!')).toEqual({ kind: 'confirm', token: 'CONFIRM' });
     expect(parseInput(' CONFIRM   REMOVEALL ', '!')).toEqual({ kind: 'confirm', token: 'CONFIRM REMOVEALL' });
+    expect(parseInput('CONFIRM LEAVE', '!')).toEqual({ kind: 'confirm', token: 'CONFIRM LEAVE' });
+    expect(parseInput('confirm leave', '!')).toEqual({ kind: 'none' });
     expect(parseInput('confirm', '!')).toEqual({ kind: 'none' });
     expect(parseInput('CONFIRM please', '!')).toEqual({ kind: 'none' });
     expect(parseInput('Reply with:\nCONFIRM', '!')).toEqual({ kind: 'none' });

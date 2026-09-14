@@ -1,7 +1,7 @@
-import { describeOperation, UserError, type Command, type PendingOperation } from '../core/types.js';
+import { describeOperation, UserError, type Command, type RemovalOperation } from '../core/types.js';
 import type { MemberEntry } from '../services/memberService.js';
 
-export function formatRemovePreview(op: PendingOperation, excluded: MemberEntry[], usedFreshList: boolean, prefix: string): string {
+export function formatRemovePreview(op: RemovalOperation, excluded: MemberEntry[], usedFreshList: boolean, prefix: string): string {
   const plan = op.groups[0]!;
   const lines = [
     op.dryRun ? 'Removal Preview (DRY RUN)' : 'Removal Preview',

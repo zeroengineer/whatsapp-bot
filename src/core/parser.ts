@@ -1,4 +1,4 @@
-export type ConfirmToken = 'CONFIRM' | 'CONFIRM REMOVEALL';
+export type ConfirmToken = 'CONFIRM' | 'CONFIRM REMOVEALL' | 'CONFIRM LEAVE';
 
 export interface ParsedCommand {
   name: string;
@@ -20,7 +20,7 @@ const DRY_RUN_FLAG = /(^|\s)--dry-?run(?=\s|$)/gi;
  */
 export function parseInput(text: string, prefix: string): ParsedInput {
   const trimmed = text.trim().replace(/\s+/g, ' ');
-  if (trimmed === 'CONFIRM' || trimmed === 'CONFIRM REMOVEALL') {
+  if (trimmed === 'CONFIRM' || trimmed === 'CONFIRM REMOVEALL' || trimmed === 'CONFIRM LEAVE') {
     return { kind: 'confirm', token: trimmed };
   }
   if (!trimmed.startsWith(prefix)) return { kind: 'none' };

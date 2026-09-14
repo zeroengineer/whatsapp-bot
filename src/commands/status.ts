@@ -42,7 +42,13 @@ export const statusCommand: Command = {
       `Groups: ${groupCount}`,
       `Last command: ${last ? `${lastName} (${formatDuration(now() - last.at)} ago)` : 'none'}`,
       `Pending operation: ${pending ? `${describeOperation(pending)}, expires in ${Math.max(0, Math.round((pending.expiresAt - now()) / 1000))}s` : 'none'}`,
-      `Running operation: ${running ? `removing in "${running.groupName}" (${running.groupCount > 1 ? `group ${running.groupIndex + 1}/${running.groupCount}, ` : ''}${running.processed}/${running.total})` : 'none'}`,
+      `Running operation: ${
+        !running
+          ? 'none'
+          : running.kind === 'leave'
+            ? `leaving "${running.groupName}" (group ${running.groupIndex + 1}/${running.groupCount})`
+            : `removing in "${running.groupName}" (${running.groupCount > 1 ? `group ${running.groupIndex + 1}/${running.groupCount}, ` : ''}${running.processed}/${running.total})`
+      }`,
       `Dry-run mode: ${config.dryRun ? 'ON' : 'off'}`,
     ].join('\n');
   },

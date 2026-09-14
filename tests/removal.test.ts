@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { GroupRemovalPlan, PendingOperation } from '../src/core/types.js';
+import type { GroupRemovalPlan, RemovalOperation as PendingOperation } from '../src/core/types.js';
 import { memberLabel } from '../src/services/memberService.js';
 import { formatGroupProgress, formatOperationReport, formatRemovalReport, RemovalService } from '../src/services/removalService.js';
 import { createNullLogger } from '../src/utils/logger.js';

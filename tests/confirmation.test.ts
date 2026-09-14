@@ -126,6 +126,51 @@ describe('multi-group confirmation', () => {
   });
 });
 
+describe('leave confirmation', () => {
+  function leaveSetup(config = {}) {
+    const h = createHarness({ config });
+    h.wa.addGroup({ jid: 'old@g.us', name: 'Old', participants: [pn(OWNER, 'Me', 'admin'), pn('914', 'Ann', 'admin')] });
+    h.wa.addGroup({ jid: 'fam@g.us', name: 'Fam', participants: [pn(OWNER, 'Me'), pn('913', 'Bro')] });
+    return h;
+  }
+
+  it('requires CONFIRM LEAVE and then runs with progress', async () => {
+    const h = leaveSetup();
+    await h.say('!groups'); // 1 Fam, 2 Old
+    await h.say('!leave 1,2');
+    expect(await h.say('CONFIRM')).toContain('CONFIRM LEAVE');
+    expect(await h.say('CONFIRM REMOVEALL')).toContain('CONFIRM LEAVE');
+    expect(h.wa.callLog).toEqual([]);
+
+    const reply = await h.say('CONFIRM LEAVE');
+    expect(reply).toContain('Leaving 2 group(s) and deleting their chats');
+    expect(reply).toContain('Fam — left, chat deleted (1/2)');
+    expect(reply).toContain('Old — removed 1 admin(s), left, chat deleted (2/2)');
+    expect(reply).toContain('Left: 2 · Chats deleted: 2 · Failed: 0');
+    expect(h.wa.callLog).toEqual(['leave:fam@g.us', 'delete:fam@g.us', 'demote:old@g.us', 'remove:old@g.us', 'leave:old@g.us', 'delete:old@g.us']);
+  });
+
+  it('expires like other operations', async () => {
+    const h = leaveSetup();
+    await h.say('!groups');
+    await h.say('!leave 1');
+    h.advance(121_000);
+    h.state.startedAt = h.now();
+    expect(await h.say('CONFIRM LEAVE')).toContain('expired');
+    expect(h.wa.leaveCalls).toHaveLength(0);
+  });
+
+  it('dry run changes nothing', async () => {
+    const h = leaveSetup({ dryRun: true });
+    await h.say('!groups');
+    const preview = await h.say('!leave 1,2');
+    expect(preview).toContain('Leave Preview (DRY RUN)');
+    const reply = await h.say('CONFIRM LEAVE');
+    expect(reply).toContain('DRY RUN — nothing was changed (2 groups)');
+    expect(h.wa.callLog).toEqual([]);
+  });
+});
+
 describe('dry-run mode', () => {
   it('--dry-run flag previews and confirms but never removes', async () => {
     const h = setup();

@@ -4,6 +4,9 @@ dist/
 # WhatsApp session credentials — NEVER commit
 auth/
 
+# Message ids/timestamps index used for chat deletion
+data/
+
 # Logs may contain group names and member numbers
 logs/
 *.log

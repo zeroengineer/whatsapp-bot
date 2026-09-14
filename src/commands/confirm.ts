@@ -1,5 +1,6 @@
 import type { ConfirmToken } from '../core/parser.js';
 import { totalTargets, type CommandContext } from '../core/types.js';
+import { formatLeaveProgress, formatLeaveReport } from '../services/leaveService.js';
 import { formatGroupProgress, formatOperationReport } from '../services/removalService.js';
 
 /** Handles CONFIRM / CONFIRM REMOVEALL replies. Not a prefixed command, so not listed in the registry. */
@@ -22,6 +23,24 @@ export async function handleConfirm(ctx: CommandContext, token: ConfirmToken): P
   }
 
   const op = result.op;
+
+  if (op.type === 'leave') {
+    const n = op.groups.length;
+    logger.warn(
+      { action: 'leave.confirmed', opId: op.id, groups: op.groups.map((g) => ({ groupJid: g.groupJid, groupName: g.groupName })), dryRun: op.dryRun },
+      'Operation confirmed',
+    );
+    await ctx.send(
+      op.dryRun
+        ? `Dry run: checking ${n} group(s)…`
+        : `Leaving ${n} group(s) and deleting their chats…\nSend ${config.commandPrefix}cancel to stop before the next step.`,
+    );
+    const report = await services.leave.execute(op, {
+      onGroupDone: n > 1 ? (r, i, count) => ctx.send(formatLeaveProgress(r, i, count)) : undefined,
+    });
+    return formatLeaveReport(report);
+  }
+
   const total = totalTargets(op);
   const multi = op.groups.length > 1;
   const where = multi ? `${op.groups.length} groups` : `"${op.groups[0]?.groupName}"`;

@@ -83,7 +83,8 @@ describe('!remove preview', () => {
     expect(reply).toContain('skipped:\n1. Akhil');
     expect(reply).toContain('4. Me');
     const pending = h.services.confirmations.getPending();
-    expect(pending?.groups[0]?.targets.map((t) => t.label)).toEqual(['Arun (+911000000004)']);
+    expect(pending?.type).toBe('remove');
+    expect(pending?.type === 'remove' && pending.groups[0]?.targets.map((t) => t.label)).toEqual(['Arun (+911000000004)']);
   });
 
   it('refuses when only admins are selected', async () => {
@@ -263,6 +264,104 @@ describe('!removeall with multiple groups', () => {
     const h = multiSetup();
     await h.say('!removeall 2,4');
     expect(await h.say('!status')).toContain('Pending operation: removeall in 2 groups (4 members)');
+  });
+});
+
+describe('!emptygroups / !nonadmingroups / !leave', () => {
+  function leaveSetup() {
+    const h = createHarness();
+    // Sorted by name: 1 Active Club, 2 Empty Solo, 3 Family Chat, 4 Old Admins, 5 Silent Group
+    h.wa.addGroup({ jid: 'active@g.us', name: 'Active Club', participants: [pn(OWNER, 'Me', 'admin'), pn('911', 'Reg')] });
+    h.wa.addGroup({ jid: 'solo@g.us', name: 'Empty Solo', participants: [pn(OWNER, 'Me', 'admin')] });
+    h.wa.addGroup({ jid: 'family@g.us', name: 'Family Chat', participants: [pn(OWNER, 'Me'), pn('912', 'Mom', 'admin'), pn('913', 'Bro')] });
+    h.wa.addGroup({
+      jid: 'old@g.us',
+      name: 'Old Admins',
+      participants: [pn(OWNER, 'Me', 'admin'), pn('914', 'Ann', 'admin'), pn('915', 'Raj', 'superadmin')],
+    });
+    h.wa.addGroup({ jid: 'silent@g.us', name: 'Silent Group', participants: [pn(OWNER, 'Me', 'admin'), pn('916', 'Zed', 'admin')] }, { deletable: false });
+    return h;
+  }
+
+  it('!emptygroups lists admin groups with no regular members, keeping !groups numbers', async () => {
+    const h = leaveSetup();
+    const reply = await h.say('!emptygroups');
+    expect(reply).toContain('Groups With No Regular Members');
+    expect(reply).toContain('2. Empty Solo — only you');
+    expect(reply).toContain("4. Old Admins — you + 2 admins (creator can't be removed)");
+    expect(reply).toContain("5. Silent Group — you + 1 admin [chat can't be deleted]");
+    expect(reply).not.toContain('Active Club');
+    expect(reply).not.toContain('Family Chat');
+    expect(reply).toContain('!leave 2,4');
+  });
+
+  it('!nonadmingroups lists groups where you are not admin', async () => {
+    const h = leaveSetup();
+    const reply = await h.say('!nonadmingroups');
+    expect(reply).toContain('3. Family Chat — 3 members');
+    expect(reply).not.toContain('Empty Solo');
+  });
+
+  it('!leave all previews the last list, skipping undeletable chats', async () => {
+    const h = leaveSetup();
+    await h.say('!emptygroups');
+    const reply = await h.say('!leave all');
+    expect(reply).toContain('Leave Preview');
+    expect(reply).toContain('Groups: 2');
+    expect(reply).toContain('2. Empty Solo [ADMIN] — leave, delete chat');
+    expect(reply).toContain('4. Old Admins [ADMIN] — demote & remove 1 admin, leave, delete chat');
+    expect(reply).toContain('   - Ann (+914)');
+    expect(reply).toContain("Raj (+915) is the group creator and can't be removed (will remain)");
+    expect(reply).toContain("Skipped (chat can't be deleted — no known messages):\n- Silent Group");
+    expect(reply).toMatch(/Reply:\nCONFIRM LEAVE/);
+    expect(h.services.confirmations.getPending()?.type).toBe('leave');
+  });
+
+  it('!leave by numbers can mix non-admin and leftover groups', async () => {
+    const h = leaveSetup();
+    await h.say('!groups');
+    const reply = await h.say('!leave 2,3');
+    expect(reply).toContain('Groups: 2');
+    expect(reply).toContain('3. Family Chat — leave, delete chat');
+  });
+
+  it('rejects admin groups that still have regular members', async () => {
+    const h = leaveSetup();
+    await h.say('!groups');
+    const reply = await h.say('!leave 1,2');
+    expect(reply).toContain('still have regular members — use !removeall first:\n- Active Club');
+    expect(h.services.confirmations.getPending()).toBeUndefined();
+  });
+
+  it('rejects !leave all without a recent list, bad numbers and too many groups', async () => {
+    const h = leaveSetup();
+    expect(await h.say('!leave all')).toContain('Send !emptygroups or !nonadmingroups first');
+    await h.say('!emptygroups');
+    h.advance(11 * 60_000);
+    h.state.startedAt = h.now();
+    expect(await h.say('!leave all')).toContain('Send !emptygroups or !nonadmingroups first');
+    await h.say('!groups');
+    expect(await h.say('!leave 9')).toContain('Group number(s) 9 do not exist');
+    expect(await h.say('!leave abc')).toContain('Usage: !leave');
+
+    const big = createHarness();
+    for (let i = 1; i <= 21; i++) big.wa.addGroup({ jid: `g${i}@g.us`, name: `G${String(i).padStart(2, '0')}`, participants: [pn(OWNER, 'Me', 'admin')] });
+    await big.say('!groups');
+    expect(await big.say('!leave 1-21')).toContain('Too many groups selected (21)');
+  });
+
+  it('refuses when every selected chat is undeletable', async () => {
+    const h = leaveSetup();
+    await h.say('!groups');
+    expect(await h.say('!leave 5')).toContain("Nothing to leave: none of the selected groups' chats can be deleted");
+    expect(h.services.confirmations.getPending()).toBeUndefined();
+  });
+
+  it('is blocked while another operation is pending', async () => {
+    const h = leaveSetup();
+    await h.say('!groups');
+    await h.say('!removeall 1');
+    expect(await h.say('!leave 2')).toContain('already pending');
   });
 });
 

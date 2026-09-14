@@ -1,6 +1,7 @@
 import type { AppConfig } from '../config.js';
 import type { ConfirmationService } from '../services/confirmationService.js';
 import type { GroupService } from '../services/groupService.js';
+import type { LeaveService } from '../services/leaveService.js';
 import type { MemberService } from '../services/memberService.js';
 import type { RemovalService } from '../services/removalService.js';
 import type { Logger } from '../utils/logger.js';
@@ -22,6 +23,8 @@ export interface BotState {
   groupList?: { jid: string; name: string }[];
   /** Ordered participant JIDs from the most recent !members per group. */
   memberSnapshots: Map<string, { jids: string[]; takenAt: number }>;
+  /** Most recent !emptygroups / !nonadmingroups list, used by `!leave all`. */
+  lastLeaveList?: { category: 'leftover' | 'nonadmin'; jids: string[]; at: number };
 }
 
 export interface Services {
@@ -29,6 +32,7 @@ export interface Services {
   members: MemberService;
   confirmations: ConfirmationService;
   removal: RemovalService;
+  leave: LeaveService;
 }
 
 export interface CommandContext {
@@ -60,7 +64,7 @@ export interface RemovalTarget {
   label: string;
 }
 
-export type OperationType = 'remove' | 'removeall';
+export type OperationType = 'remove' | 'removeall' | 'leave';
 
 /** What to remove from one group. */
 export interface GroupRemovalPlan {
@@ -70,20 +74,51 @@ export interface GroupRemovalPlan {
   protectedAdmins: number;
 }
 
-/** A confirmed-or-pending destructive operation over one or more groups (processed in order). */
-export interface PendingOperation {
+/** What to do in one group when leaving it. */
+export interface LeavePlan {
+  groupJid: string;
+  groupName: string;
+  /** Number in the !groups list. */
+  index: number;
+  selfIsAdmin: boolean;
+  /** Other admins to demote and remove before leaving (admin groups only; excludes the creator). */
+  adminsToRemove: RemovalTarget[];
+  /** Group creator who cannot be demoted or removed, if present and not you. */
+  creatorNotRemovable?: RemovalTarget;
+}
+
+interface OperationBase {
   id: string;
-  type: OperationType;
-  groups: GroupRemovalPlan[];
   dryRun: boolean;
   createdAt: number;
   expiresAt: number;
 }
 
-export const totalTargets = (op: Pick<PendingOperation, 'groups'>): number => op.groups.reduce((n, g) => n + g.targets.length, 0);
+/** Removal over one or more groups (processed in order). */
+export interface RemovalOperation extends OperationBase {
+  type: 'remove' | 'removeall';
+  groups: GroupRemovalPlan[];
+}
 
-/** `remove in "College Group" (2 members)` or `removeall in 3 groups (89 members)` */
-export function describeOperation(op: Pick<PendingOperation, 'type' | 'groups'>): string {
+/** Leave (and delete chat) over one or more groups (processed in order). */
+export interface LeaveOperation extends OperationBase {
+  type: 'leave';
+  groups: LeavePlan[];
+}
+
+/** A confirmed-or-pending destructive operation. */
+export type PendingOperation = RemovalOperation | LeaveOperation;
+
+/** Input for creating a pending operation (id and timestamps are assigned by the service). */
+export type NewOperation =
+  | (Omit<RemovalOperation, keyof OperationBase> & { dryRun: boolean })
+  | (Omit<LeaveOperation, keyof OperationBase> & { dryRun: boolean });
+
+export const totalTargets = (op: Pick<RemovalOperation, 'groups'>): number => op.groups.reduce((n, g) => n + g.targets.length, 0);
+
+/** `remove in "College Group" (2 members)`, `removeall in 3 groups (89 members)`, `leave 3 groups` */
+export function describeOperation(op: PendingOperation | NewOperation): string {
   const where = op.groups.length === 1 ? `"${op.groups[0]?.groupName}"` : `${op.groups.length} groups`;
+  if (op.type === 'leave') return `leave ${where}`;
   return `${op.type} in ${where} (${totalTargets(op)} members)`;
 }

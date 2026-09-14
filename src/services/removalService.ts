@@ -1,4 +1,5 @@
-import { UserError, type GroupRemovalPlan, type PendingOperation, type RemovalTarget } from '../core/types.js';
+import { UserError, type GroupRemovalPlan, type RemovalOperation, type RemovalTarget } from '../core/types.js';
+import { OperationLock, type RunningInfo, type RunningOperation } from './operationLock.js';
 import type { Logger } from '../utils/logger.js';
 import { isAdmin, isSelfParticipant, normalizeJid, selfIsGroupAdmin, splitJid } from '../utils/permissions.js';
 import { backoffDelay, describeError, errorStatusCode, sleep as realSleep, TimeoutError } from '../utils/retry.js';
@@ -24,7 +25,7 @@ export interface FailedEntry {
 
 export interface RemovalReport {
   opId: string;
-  type: PendingOperation['type'];
+  type: RemovalOperation['type'];
   groupJid: string;
   groupName: string;
   dryRun: boolean;
@@ -48,7 +49,7 @@ export interface RemovalReport {
 /** Result of a whole operation: one report per group, in processing order. */
 export interface OperationReport {
   opId: string;
-  type: PendingOperation['type'];
+  type: RemovalOperation['type'];
   dryRun: boolean;
   groups: RemovalReport[];
   cancelled: boolean;
@@ -85,14 +86,14 @@ export function describeParticipantStatus(status: string): string {
   }
 }
 
-function isTransientError(err: unknown): boolean {
+export function isTransientError(err: unknown): boolean {
   if (err instanceof TimeoutError || err instanceof NotConnectedError) return true;
   const code = errorStatusCode(err);
   return code === undefined || TRANSIENT_CODES.has(code);
 }
 
 /** Match a WhatsApp result entry (which may use LID or PN addressing) to a target participant. */
-function resultMatches(result: ParticipantUpdateResult, p: Participant): boolean {
+export function resultMatches(result: ParticipantUpdateResult, p: Participant): boolean {
   if (!result.jid) return false;
   const r = normalizeJid(result.jid);
   if (r === normalizeJid(p.jid)) return true;
@@ -101,28 +102,22 @@ function resultMatches(result: ParticipantUpdateResult, p: Participant): boolean
   return !!p.phoneNumber && result.jid.endsWith('@s.whatsapp.net') && user === p.phoneNumber;
 }
 
-export interface RunningInfo {
-  opId: string;
-  groupName: string;
-  groupIndex: number;
-  groupCount: number;
-  total: number;
-  processed: number;
+export type ParticipantAction = 'remove' | 'demote';
+
+/** Outcome of applying remove/demote to a list of participants in batches. */
+export interface ParticipantActionResult {
+  /** WhatsApp returned status 200. */
+  succeeded: RemovalTarget[];
+  failed: FailedEntry[];
+  skipped: FailedEntry[];
+  notAttempted: FailedEntry[];
+  stopped?: 'cancelled' | 'connection_lost';
 }
 
-interface RunningOperation {
-  opId: string;
-  groupName: string;
-  groupIndex: number;
-  groupCount: number;
-  total: number;
-  processed: number;
-  cancelRequested: boolean;
-  done: Promise<void>;
-}
+export type { RunningInfo } from './operationLock.js';
 
 export class RemovalService {
-  private running: RunningOperation | undefined;
+  readonly lock: OperationLock;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly maxBatchAttempts: number;
   private readonly reconnectWaitMs: number;
@@ -132,49 +127,40 @@ export class RemovalService {
     private readonly wa: WhatsAppClient,
     private readonly logger: Logger,
     private readonly opts: RemovalOptions,
+    lock?: OperationLock,
   ) {
+    this.lock = lock ?? new OperationLock();
     this.sleep = opts.sleep ?? realSleep;
     this.maxBatchAttempts = opts.maxBatchAttempts ?? 3;
     this.reconnectWaitMs = opts.reconnectWaitMs ?? 120_000;
     this.rateLimitWaitMs = opts.rateLimitWaitMs ?? 30_000;
   }
 
+  /** The running destructive operation (removal or leave), if any. */
   getRunning(): RunningInfo | undefined {
-    if (!this.running) return undefined;
-    const { opId, groupName, groupIndex, groupCount, total, processed } = this.running;
-    return { opId, groupName, groupIndex, groupCount, total, processed };
+    return this.lock.get();
   }
 
   /** Ask the running operation to stop after the current batch. Returns false if nothing is running. */
   requestCancel(): boolean {
-    if (!this.running) return false;
-    this.running.cancelRequested = true;
-    return true;
+    return this.lock.requestCancel();
   }
 
   /** Resolves when no operation is running or the timeout elapses. */
-  async waitForIdle(timeoutMs: number): Promise<boolean> {
-    if (!this.running) return true;
-    const done = this.running.done.then(() => true);
-    return Promise.race([done, realSleep(timeoutMs).then(() => !this.running)]);
+  waitForIdle(timeoutMs: number): Promise<boolean> {
+    return this.lock.waitForIdle(timeoutMs);
   }
 
-  async execute(op: PendingOperation, options: ExecuteOptions = {}): Promise<OperationReport> {
-    if (this.running) throw new UserError(`A removal is already running in "${this.running.groupName}". Wait for it to finish.`);
+  async execute(op: RemovalOperation, options: ExecuteOptions = {}): Promise<OperationReport> {
     if (op.groups.length === 0) throw new UserError('Nothing to remove.');
-
-    let finish!: () => void;
-    const running: RunningOperation = {
+    const running = this.lock.acquire({
+      kind: 'removal',
       opId: op.id,
       groupName: op.groups[0]!.groupName,
       groupIndex: 0,
       groupCount: op.groups.length,
       total: op.groups[0]!.targets.length,
-      processed: 0,
-      cancelRequested: false,
-      done: new Promise<void>((r) => (finish = r)),
-    };
-    this.running = running;
+    });
     const opLog = this.logger.child({ opId: op.id, action: op.type, dryRun: op.dryRun });
     const result: OperationReport = { opId: op.id, type: op.type, dryRun: op.dryRun, groups: [], cancelled: false };
 
@@ -224,12 +210,11 @@ export class RemovalService {
       );
       return result;
     } finally {
-      this.running = undefined;
-      finish();
+      this.lock.release(running);
     }
   }
 
-  private emptyReport(op: PendingOperation, plan: GroupRemovalPlan): RemovalReport {
+  private emptyReport(op: RemovalOperation, plan: GroupRemovalPlan): RemovalReport {
     return {
       opId: op.id,
       type: op.type,
@@ -246,7 +231,7 @@ export class RemovalService {
     };
   }
 
-  private async executeGroup(op: PendingOperation, plan: GroupRemovalPlan, running: RunningOperation, report: RemovalReport): Promise<void> {
+  private async executeGroup(op: RemovalOperation, plan: GroupRemovalPlan, running: RunningOperation, report: RemovalReport): Promise<void> {
     const log = this.logger.child({ opId: op.id, action: op.type, groupJid: plan.groupJid, groupName: plan.groupName, dryRun: op.dryRun });
     {
       log.info({ targetCount: plan.targets.length }, 'Removal operation started');
@@ -269,7 +254,7 @@ export class RemovalService {
     }
   }
 
-  private async fetchGroupWithRetry(groupJid: string): Promise<GroupInfo> {
+  async fetchGroupWithRetry(groupJid: string): Promise<GroupInfo> {
     let lastErr: unknown;
     for (let attempt = 0; attempt < this.maxBatchAttempts; attempt++) {
       try {
@@ -284,7 +269,7 @@ export class RemovalService {
     throw lastErr;
   }
 
-  private async ensureConnected(): Promise<boolean> {
+  async ensureConnected(): Promise<boolean> {
     if (this.wa.getConnectionStatus() === 'open') return true;
     return this.wa.waitForConnection(this.reconnectWaitMs);
   }
@@ -327,57 +312,13 @@ export class RemovalService {
     }
 
     // 2. Remove in batches.
-    const reportedRemoved: RemovalTarget[] = [];
-    const queue = [...eligible];
-    const retriedOnce = new Set<string>();
-    let batchNo = 0;
-
-    while (queue.length > 0) {
-      if (running.cancelRequested) {
-        report.cancelled = true;
-        report.stopped = 'cancelled';
-        report.notAttempted.push(...queue.splice(0).map((target) => ({ target, reason: 'cancelled' })));
-        break;
-      }
-
-      const batch = queue.splice(0, this.opts.batchSize);
-      batchNo++;
-      const outcome = await this.sendBatch(plan.groupJid, batch, log, batchNo);
-
-      if (outcome.kind === 'connection_lost') {
-        report.stopped = 'connection_lost';
-        report.notAttempted.push(...[...batch, ...queue.splice(0)].map((target) => ({ target, reason: 'not attempted (connection lost)' })));
-        break;
-      }
-      if (outcome.kind === 'fatal') {
-        report.failed.push(...batch.map((target) => ({ target, reason: outcome.reason })));
-        report.notAttempted.push(...queue.splice(0).map((target) => ({ target, reason: `stopped after error: ${outcome.reason}` })));
-        break;
-      }
-      if (outcome.kind === 'failed') {
-        report.failed.push(...batch.map((target) => ({ target, reason: outcome.reason })));
-      } else {
-        for (const target of batch) {
-          const result = outcome.results.find((r) => resultMatches(r, target.participant));
-          if (!result) {
-            report.failed.push({ target, reason: 'no confirmation from WhatsApp' });
-          } else if (result.status === '200') {
-            reportedRemoved.push(target);
-          } else if (result.status === '404' && outcome.attempts > 1) {
-            // An earlier attempt may have succeeded before timing out; don't claim it either way.
-            report.skipped.push({ target, reason: 'no longer in group (an earlier timed-out attempt may have removed them)' });
-          } else if (TRANSIENT_STATUS.has(result.status) && !retriedOnce.has(target.participant.jid)) {
-            retriedOnce.add(target.participant.jid);
-            queue.push(target);
-          } else {
-            report.failed.push({ target, reason: describeParticipantStatus(result.status) });
-          }
-        }
-      }
-
-      running.processed = plan.targets.length - queue.length;
-      if (queue.length > 0 && this.opts.batchDelayMs > 0) await this.sleep(this.opts.batchDelayMs);
-    }
+    const outcome = await this.applyParticipantAction(plan.groupJid, eligible, 'remove', running, log, plan.targets.length);
+    const reportedRemoved = outcome.succeeded;
+    report.failed.push(...outcome.failed);
+    report.skipped.push(...outcome.skipped);
+    report.notAttempted.push(...outcome.notAttempted);
+    if (outcome.stopped) report.stopped = outcome.stopped;
+    if (outcome.stopped === 'cancelled') report.cancelled = true;
 
     // 3. Verify: never report a removal the group state contradicts.
     if (reportedRemoved.length === 0) return;
@@ -398,11 +339,78 @@ export class RemovalService {
     }
   }
 
+  /**
+   * Apply remove/demote to participants in paced batches, with request retries, a one-time retry for
+   * members with a transient status, and stops on cancellation or lost connection.
+   * Only WhatsApp status 200 counts as success.
+   */
+  async applyParticipantAction(
+    groupJid: string,
+    targets: RemovalTarget[],
+    action: ParticipantAction,
+    running: RunningOperation,
+    log: Logger,
+    progressTotal = targets.length,
+  ): Promise<ParticipantActionResult> {
+    const out: ParticipantActionResult = { succeeded: [], failed: [], skipped: [], notAttempted: [] };
+    const queue = [...targets];
+    const retriedOnce = new Set<string>();
+    let batchNo = 0;
+
+    while (queue.length > 0) {
+      if (running.cancelRequested) {
+        out.stopped = 'cancelled';
+        out.notAttempted.push(...queue.splice(0).map((target) => ({ target, reason: 'cancelled' })));
+        break;
+      }
+
+      const batch = queue.splice(0, this.opts.batchSize);
+      batchNo++;
+      const outcome = await this.sendBatch(groupJid, batch, log, batchNo, action);
+
+      if (outcome.kind === 'connection_lost') {
+        out.stopped = 'connection_lost';
+        out.notAttempted.push(...[...batch, ...queue.splice(0)].map((target) => ({ target, reason: 'not attempted (connection lost)' })));
+        break;
+      }
+      if (outcome.kind === 'fatal') {
+        out.failed.push(...batch.map((target) => ({ target, reason: outcome.reason })));
+        out.notAttempted.push(...queue.splice(0).map((target) => ({ target, reason: `stopped after error: ${outcome.reason}` })));
+        break;
+      }
+      if (outcome.kind === 'failed') {
+        out.failed.push(...batch.map((target) => ({ target, reason: outcome.reason })));
+      } else {
+        for (const target of batch) {
+          const result = outcome.results.find((r) => resultMatches(r, target.participant));
+          if (!result) {
+            out.failed.push({ target, reason: 'no confirmation from WhatsApp' });
+          } else if (result.status === '200') {
+            out.succeeded.push(target);
+          } else if (result.status === '404' && outcome.attempts > 1) {
+            // An earlier attempt may have succeeded before timing out; don't claim it either way.
+            out.skipped.push({ target, reason: 'no longer in group (an earlier timed-out attempt may have removed them)' });
+          } else if (TRANSIENT_STATUS.has(result.status) && !retriedOnce.has(target.participant.jid)) {
+            retriedOnce.add(target.participant.jid);
+            queue.push(target);
+          } else {
+            out.failed.push({ target, reason: describeParticipantStatus(result.status) });
+          }
+        }
+      }
+
+      running.processed = progressTotal - queue.length;
+      if (queue.length > 0 && this.opts.batchDelayMs > 0) await this.sleep(this.opts.batchDelayMs);
+    }
+    return out;
+  }
+
   private async sendBatch(
     groupJid: string,
     batch: RemovalTarget[],
     log: Logger,
     batchNo: number,
+    action: ParticipantAction,
   ): Promise<
     | { kind: 'ok'; results: ParticipantUpdateResult[]; attempts: number }
     | { kind: 'failed'; reason: string }
@@ -416,12 +424,13 @@ export class RemovalService {
         return { kind: 'connection_lost' };
       }
       try {
-        const results = await this.wa.removeParticipants(groupJid, jids);
-        log.info({ batchNo, attempt, results }, 'Removal batch result');
+        const results =
+          action === 'demote' ? await this.wa.demoteParticipants(groupJid, jids) : await this.wa.removeParticipants(groupJid, jids);
+        log.info({ action, batchNo, attempt, results }, `${action} batch result`);
         return { kind: 'ok', results, attempts: attempt };
       } catch (err) {
         const code = errorStatusCode(err);
-        log.warn({ batchNo, attempt, code, err: describeError(err) }, 'Removal batch request failed');
+        log.warn({ action, batchNo, attempt, code, err: describeError(err) }, `${action} batch request failed`);
         if (code === 401 || code === 403) return { kind: 'fatal', reason: 'permission error' };
         if (code === 404) return { kind: 'fatal', reason: 'group not found' };
         if (!isTransientError(err)) return { kind: 'failed', reason: describeError(err) };

@@ -17,7 +17,8 @@ export const cancelCommand: Command = {
     if (running && services.removal.requestCancel()) {
       logger.warn({ action: 'cancel.running', opId: running.opId }, 'Cancellation requested for running removal');
       const rest = running.groupCount > 1 ? ' Remaining groups will not be touched.' : '';
-      return `Stopping the removal in "${running.groupName}" after the current batch.${rest} A report will follow.`;
+      const what = running.kind === 'leave' ? 'leave operation' : 'removal';
+      return `Stopping the ${what} in "${running.groupName}" at the next safe point.${rest} A report will follow.`;
     }
     return 'There is no pending operation.';
   },
