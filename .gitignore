@@ -1,0 +1,14 @@
+node_modules/
+dist/
+
+# WhatsApp session credentials — NEVER commit
+auth/
+
+# Logs may contain group names and member numbers
+logs/
+*.log
+
+# Local configuration
+.env
+.env.*
+!.env.example
